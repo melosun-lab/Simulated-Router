@@ -1,19 +1,3 @@
-/* -*- Mode:C++; c-file-style:"gnu"; indent-tabs-mode:nil; -*- */
-/***
- * Copyright (c) 2017 Alexander Afanasyev
- *
- * This program is free software: you can redistribute it and/or modify it under the terms of
- * the GNU General Public License as published by the Free Software Foundation, either version
- * 3 of the License, or (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY;
- * without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
- * See the GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License along with this program.
- * If not, see <http://www.gnu.org/licenses/>.
- */
-
 #include "simple-router.hpp"
 #include "core/utils.hpp"
 
@@ -21,28 +5,163 @@
 
 namespace simple_router {
 
-//////////////////////////////////////////////////////////////////////////
-//////////////////////////////////////////////////////////////////////////
-// IMPLEMENT THIS METHOD
+uint16_t calc_ip_checksum(ip_hdr *ip_header) {
+  uint16_t prev_checksum = ip_header->ip_sum;
+  ip_header->ip_sum = 0;
+  uint32_t new_checksum = 0;
+  uint16_t ip_len = 4 * ip_header->ip_hl;
+  for (uint16_t *p = (uint16_t *)ip_header, i = 0; i < ip_len; i+=2, p++) {
+    new_checksum += ntohs(*p);
+    // fprintf(stderr, "%04x ", ntohs(*p));
+  }
+  // fprintf(stderr, "\nchecksum: (%x)", new_checksum);
+  ip_header->ip_sum = prev_checksum;
+  new_checksum = (new_checksum & 0xffff) + (new_checksum >> 16);
+  new_checksum = (new_checksum & 0xffff) + (new_checksum >> 16);
+  // fprintf(stderr, " %x\n",  (uint16_t)~new_checksum);
+  return htons((uint16_t)~new_checksum);
+}
+
+uint16_t calc_icmp_checksum(icmp_hdr *icmp_h, uint32_t len) {
+  uint16_t prev_checksum = icmp_h->icmp_sum;
+  icmp_h->icmp_sum = 0;
+  uint32_t new_checksum = 0;
+  for (uint16_t *p = (uint16_t *)icmp_h, i = 0; i < len; i+=2, p++) {
+    new_checksum += ntohs(*p);
+  }
+  icmp_h->icmp_sum = prev_checksum;
+  new_checksum = (new_checksum & 0xffff) + (new_checksum >> 16);
+  new_checksum = (new_checksum & 0xffff) + (new_checksum >> 16);
+  return htons((uint16_t)~new_checksum);
+}
+
 void
 SimpleRouter::handlePacket(const Buffer& packet, const std::string& inIface)
 {
-  std::cerr << "Got packet of size " << packet.size() << " on interface " << inIface << std::endl;
+  // std::cerr << std::endl << "-------------------------------" << std::endl;
+  // std::cerr << "Got packet of size " << packet.size() << " on interface " << inIface << std::endl;
 
   const Interface* iface = findIfaceByName(inIface);
   if (iface == nullptr) {
-    std::cerr << "Received packet, but interface is unknown, ignoring" << std::endl;
+    // std::cerr << "Received packet, but interface is unknown, ignoring" << std::endl;
     return;
   }
 
-  std::cerr << getRoutingTable() << std::endl;
+  // extract ethernet frame
+  struct ethernet_hdr* ethHdr = (struct ethernet_hdr*)packet.data();
+  if (ethertype(packet.data()) != ethertype_ip) { // ignore non ip packets
+    // std::cerr << "invalid ethertype" << ethertype(packet.data()) << std::endl;
+    return;
+  }
 
-  // FILL THIS IN
+  // std::cerr << "routing table:\n" << getRoutingTable() << std::endl;
+  // std::cerr << "arp cache:\n" << m_arp << std::endl;
+  // std::cerr <<"[Packet Received]\n";
+  // print_hdr_eth(packet.data());
+
+  auto packet_mac = macToString(ethHdr->ether_dhost);
+  if (packet_mac != macToString(iface->addr) && packet_mac != "FF:FF:FF:FF:FF:FF") {
+    return;
+  }
+
+  // handle ip packet
+  struct ip_hdr* ipHdr = (struct ip_hdr*)(packet.data() + sizeof(struct ethernet_hdr));
+  // print_hdr_ip((uint8_t*)ipHdr);
+
+  // error checking
+  if (ipHdr->ip_len < 20 || ipHdr->ip_sum != calc_ip_checksum(ipHdr)) {
+    return;
+  }
+
+  uint32_t src_ip = ipHdr->ip_src;
+  uint32_t dst_ip = ipHdr->ip_dst;
+
+  // find if dst is me
+  bool dst_is_me = false;
+  for (auto& iface: m_ifaces) {
+    if (iface.ip == dst_ip) {
+      dst_is_me = true;
+      break;
+    }
+  }
+  // if (dst_ip == 0xFFFFFFFF) // broadcast
+  //   dst_is_me = true;
+
+  if (dst_is_me) {
+    // std::cerr << "Dst is me!" << std::endl;
+    // std::cerr << "sending packet" << std::endl;
+    if (ipHdr->ip_p == ip_protocol_icmp) { // icmp packet
+      // handle icmp packet
+      struct icmp_hdr* icmpHdr = (struct icmp_hdr*)(packet.data() + sizeof(struct ethernet_hdr)
+        + sizeof(struct ip_hdr));
+      uint32_t icmp_len = ntohs(ipHdr->ip_len) - 4 * ipHdr->ip_hl;
+
+      // error checking
+      if (icmpHdr->icmp_sum != calc_icmp_checksum(icmpHdr, icmp_len)) {
+        return;
+      }
+      
+      if (icmpHdr->icmp_type == 0x08) { // ECHO
+        // packet for sending
+        Buffer out_packet(packet);
+        struct ethernet_hdr* out_ethHdr = (struct ethernet_hdr*)out_packet.data();
+        struct ip_hdr* out_ipHdr = (struct ip_hdr*)(out_packet.data() + sizeof(struct ethernet_hdr));
+        struct icmp_hdr* out_icmpHdr = (struct icmp_hdr*)(out_packet.data() + sizeof(struct ethernet_hdr)
+          + sizeof(struct ip_hdr));
+        
+        // swap mac addr
+        for (int i = 0; i < ETHER_ADDR_LEN; i++) {
+          auto tmp = out_ethHdr->ether_dhost[i];
+          out_ethHdr->ether_dhost[i] = out_ethHdr->ether_shost[i];
+          out_ethHdr->ether_shost[i] = tmp;
+        }
+        // swap src and dst ip
+        out_ipHdr->ip_dst = src_ip;
+        out_ipHdr->ip_src = dst_ip;
+        // change ip ttl
+        out_ipHdr->ip_ttl = 64;
+        // change icmp type
+        out_icmpHdr->icmp_type = 0x00;
+        // checksums
+        out_icmpHdr->icmp_sum = calc_icmp_checksum(out_icmpHdr, icmp_len);
+        out_ipHdr->ip_sum = calc_ip_checksum(out_ipHdr);
+
+        // std::cerr << "sending packet" << std::endl;
+        // print_hdr_eth((uint8_t*)out_ethHdr);
+        // print_hdr_ip((uint8_t*)out_ipHdr);
+        // print_hdr_icmp((uint8_t*)out_icmpHdr);
+        sendPacket(out_packet, inIface);
+      }
+    }
+  } else { // routing
+    Buffer out_packet(packet);
+    struct ethernet_hdr* out_ethHdr = (struct ethernet_hdr*)out_packet.data();
+    struct ip_hdr* out_ipHdr = (struct ip_hdr*)(out_packet.data() + sizeof(struct ethernet_hdr));
+    out_ipHdr->ip_ttl--;
+    if (out_ipHdr->ip_ttl == 0) // ttl = 0
+      return;
+    out_ipHdr->ip_sum = calc_ip_checksum(out_ipHdr);
+
+    auto entry = m_routingTable.lookup(dst_ip);
+    auto out_iface = findIfaceByName(entry.ifName);
+    // std::cerr << "found entry: " << ipToString(entry.gw) << " / " << entry.ifName << std::endl;
+
+    auto arpEntry = m_arp.lookup(dst_ip);
+    if (arpEntry.get() != NULL) { // send packet
+      // std::cerr << "got arp entry" << std::endl;
+      memcpy(out_ethHdr->ether_shost, out_iface->addr.data(), ETHER_ADDR_LEN);
+      memcpy(out_ethHdr->ether_dhost, arpEntry.get()->mac.data(), ETHER_ADDR_LEN);
+      // print_hdr_eth((uint8_t*)out_ethHdr);
+      // print_hdr_ip((uint8_t*)out_ipHdr);
+      sendPacket(out_packet, out_iface->name);
+      // std::cerr << "packet sent through " << out_iface->name << std::endl;
+    } else { // generate arp request
+      m_arp.queueRequest(dst_ip, out_packet, entry.ifName);
+      // std::cerr << "arp request queued" << std::endl;
+    }
+  }
 }
-//////////////////////////////////////////////////////////////////////////
-//////////////////////////////////////////////////////////////////////////
 
-// You should not need to touch the rest of this code.
 SimpleRouter::SimpleRouter()
   : m_arp(*this)
 {

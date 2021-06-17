@@ -1,19 +1,3 @@
-/* -*- Mode:C++; c-file-style:"gnu"; indent-tabs-mode:nil; -*- */
-/**
- * Copyright (c) 2017 Alexander Afanasyev
- *
- * This program is free software: you can redistribute it and/or modify it under the terms of
- * the GNU General Public License as published by the Free Software Foundation, either version
- * 3 of the License, or (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY;
- * without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
- * See the GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License along with this program.
- * If not, see <http://www.gnu.org/licenses/>.
- */
-
 #include "routing-table.hpp"
 #include "core/utils.hpp"
 
@@ -25,21 +9,28 @@
 
 namespace simple_router {
 
-//////////////////////////////////////////////////////////////////////////
-//////////////////////////////////////////////////////////////////////////
-// IMPLEMENT THIS METHOD
 RoutingTableEntry
 RoutingTable::lookup(uint32_t ip) const
 {
+  uint32_t best_mask = 0;
+  RoutingTableEntry best_entry;
+  bool is_found = false;
+  for (auto &entry: m_entries) { // check each entry
+    if ((entry.mask & ip) == (entry.mask & entry.dest)) { // matched
+      if (!is_found || entry.mask > best_mask) {
+        best_mask = entry.mask;
+        best_entry = entry;
+        is_found = true;
+      }
+    }
+  }
 
-  // FILL THIS IN
-
-  throw std::runtime_error("Routing entry not found");
+  if (!is_found)
+    throw std::runtime_error("Routing entry not found");
+  else
+    return best_entry;
 }
-//////////////////////////////////////////////////////////////////////////
-//////////////////////////////////////////////////////////////////////////
 
-// You should not need to touch the rest of this code.
 
 bool
 RoutingTable::load(const std::string& file)
